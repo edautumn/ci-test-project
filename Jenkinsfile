@@ -8,6 +8,8 @@ pipeline {
     environment {
         POLL_INTERVAL_SEC = '15'
         POLL_TIMEOUT_MIN  = '30'
+        // 从 Jenkins Credentials 中读取账号密码（不会打印到日志）
+        CG_CREDS = credentials('codeguardian-credentials')
     }
     stages {
 
@@ -23,6 +25,33 @@ pipeline {
             }
         }
 
+        stage('Login to CodeGuardian') {
+            steps {
+                script {
+                    // POST /api/auth/login，获取 satoken
+                    def loginResp = sh(
+                        script: """curl -s -X POST "${params.CODE_GUARDIAN_URL}/api/auth/login" \
+                            -H "Content-Type: application/json" \
+                            -d '{"usernameOrEmail":"${env.CG_CREDS_USR}","password":"${env.CG_CREDS_PSW}'\\''""",
+                        returnStdout: true
+                    ).trim()
+
+                    echo "登录响应: ${loginResp}"
+
+                    // 提取 token 字段
+                    env.CG_TOKEN = sh(
+                        script: """echo '${loginResp}' | grep -o '"token":"[^"]*"' | grep -o ':[^}]*' | tr -d ':"'""",
+                        returnStdout: true
+                    ).trim()
+
+                    if (!env.CG_TOKEN) {
+                        error("登录失败，未获取到 Token，请检查 codeguardian-credentials 中的账号密码是否正确")
+                    }
+                    echo "登录成功，已获取 Token"
+                }
+            }
+        }
+
         stage('Trigger Code Review') {
             steps {
                 script {
@@ -30,12 +59,12 @@ pipeline {
                     def response = sh(
                         script: """curl -s -X POST "${params.CODE_GUARDIAN_URL}/api/v1/cicd/trigger" \
                             -H "Content-Type: application/json" \
+                            -H "satoken: ${env.CG_TOKEN}" \
                             -d '${body}'""",
                         returnStdout: true
                     ).trim()
                     echo "触发响应: ${response}"
 
-                    // 解析 taskId（用 grep/sed 提取，不依赖插件）
                     env.REVIEW_TASK_ID = sh(
                         script: """echo '${response}' | grep -o '"taskId":[0-9]*' | grep -o '[0-9]*'""",
                         returnStdout: true
@@ -43,7 +72,7 @@ pipeline {
                     echo "审查任务已提交，Task ID: ${env.REVIEW_TASK_ID}"
 
                     if (!env.REVIEW_TASK_ID) {
-                        error("未能获取 Task ID，请检查 CodeGuardian 服务是否正常运行")
+                        error("未能获取 Task ID，请检查 CodeGuardian 服务日志")
                     }
                 }
             }
@@ -53,26 +82,20 @@ pipeline {
             steps {
                 script {
                     def statusUrl = "${params.CODE_GUARDIAN_URL}/api/v1/cicd/status/${env.REVIEW_TASK_ID}?blockOn=${params.BLOCK_ON}"
-                    def timeoutMin = env.POLL_TIMEOUT_MIN.toInteger()
-                    def intervalSec = env.POLL_INTERVAL_SEC.toInteger()
-
-                    timeout(time: timeoutMin, unit: 'MINUTES') {
-                        waitUntil(initialRecurrencePeriod: intervalSec * 1000) {
+                    timeout(time: env.POLL_TIMEOUT_MIN.toInteger(), unit: 'MINUTES') {
+                        waitUntil(initialRecurrencePeriod: env.POLL_INTERVAL_SEC.toInteger() * 1000) {
                             def resp = sh(
-                                script: """curl -s "${statusUrl}" """,
+                                script: """curl -s "${statusUrl}" -H "satoken: ${env.CG_TOKEN}" """,
                                 returnStdout: true
                             ).trim()
-
                             def status = sh(
-                                script: """echo '${resp}' | grep -o '"status":"[^"]*"' | head -1 | grep -o ':[^}]*' | tr -d ':"'""",
+                                script: """echo '${resp}' | grep -o '"status":"[^"]*"' | head -1 | grep -o ':"[^"]*"' | tr -d ':"'""",
                                 returnStdout: true
                             ).trim()
-
                             def message = sh(
-                                script: """echo '${resp}' | grep -o '"message":"[^"]*"' | grep -o ':[^}]*' | tr -d ':"'""",
+                                script: """echo '${resp}' | grep -o '"message":"[^"]*"' | grep -o ':"[^"]*"' | tr -d ':"'""",
                                 returnStdout: true
                             ).trim()
-
                             echo "当前状态: ${status} | ${message}"
                             return (status == 'COMPLETED' || status == 'FAILED')
                         }
@@ -85,21 +108,20 @@ pipeline {
             steps {
                 script {
                     def statusUrl = "${params.CODE_GUARDIAN_URL}/api/v1/cicd/status/${env.REVIEW_TASK_ID}?blockOn=${params.BLOCK_ON}"
-                    def resp = sh(script: """curl -s "${statusUrl}" """, returnStdout: true).trim()
-                    echo "最终审查结果: ${resp}"
-
-                    def passed = sh(
-                        script: """echo '${resp}' | grep -o '"passed":[a-z]*' | grep -o '[a-z]*\$'""",
+                    def resp = sh(
+                        script: """curl -s "${statusUrl}" -H "satoken: ${env.CG_TOKEN}" """,
                         returnStdout: true
                     ).trim()
+                    echo "最终审查结果: ${resp}"
 
+                    def passed   = sh(script: """echo '${resp}' | grep -o '"passed":[a-z]*' | grep -o '[a-z]*\$'""", returnStdout: true).trim()
                     def critical = sh(script: """echo '${resp}' | grep -o '"critical":[0-9]*' | grep -o '[0-9]*'""", returnStdout: true).trim() ?: '0'
                     def high     = sh(script: """echo '${resp}' | grep -o '"high":[0-9]*' | grep -o '[0-9]*'""",     returnStdout: true).trim() ?: '0'
                     def medium   = sh(script: """echo '${resp}' | grep -o '"medium":[0-9]*' | grep -o '[0-9]*'""",   returnStdout: true).trim() ?: '0'
                     def low      = sh(script: """echo '${resp}' | grep -o '"low":[0-9]*' | grep -o '[0-9]*'""",      returnStdout: true).trim() ?: '0'
 
                     echo "审查结果: ${passed == 'true' ? '✅ 通过' : '❌ 未通过'} | C:${critical} H:${high} M:${medium} L:${low}"
-                    currentBuild.description = "C:${critical} H:${high} M:${medium} L:${low}"
+                    currentBuild.description = "${passed == 'true' ? '✅' : '❌'} C:${critical} H:${high} M:${medium} L:${low}"
 
                     if (passed != 'true' && params.FAIL_ON_GATE) {
                         error("质量门禁未通过：存在 ${params.BLOCK_ON} 级别及以上问题")
