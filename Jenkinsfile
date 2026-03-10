@@ -29,7 +29,8 @@ pipeline {
                     ])
                     def resp = httpRequest(httpMode: 'POST', url: "${params.CODE_GUARDIAN_URL}/api/v1/cicd/trigger",
                         contentType: 'APPLICATION_JSON', requestBody: body, validResponseCodes: '200')
-                    env.REVIEW_TASK_ID = (readJSON text: resp.content).taskId.toString()
+                    def triggerResult = readJSON text: resp.content
+                    env.REVIEW_TASK_ID = triggerResult.taskId.toString()
                     echo "Task ID: ${env.REVIEW_TASK_ID}"
                 }
             }
@@ -40,7 +41,8 @@ pipeline {
                     def url = "${params.CODE_GUARDIAN_URL}/api/v1/cicd/status/${env.REVIEW_TASK_ID}?blockOn=${params.BLOCK_ON}"
                     timeout(time: env.POLL_TIMEOUT_MIN.toInteger(), unit: 'MINUTES') {
                         waitUntil(initialRecurrencePeriod: env.POLL_INTERVAL_SEC.toInteger() * 1000) {
-                            def s = readJSON text: httpRequest(httpMode: 'GET', url: url, validResponseCodes: '200').content
+                            def pollResp = httpRequest(httpMode: 'GET', url: url, validResponseCodes: '200')
+                            def s = readJSON text: pollResp.content
                             echo "状态: ${s.status} | ${s.message}"
                             return s.status in ['COMPLETED', 'FAILED']
                         }
@@ -52,7 +54,8 @@ pipeline {
             steps {
                 script {
                     def url    = "${params.CODE_GUARDIAN_URL}/api/v1/cicd/status/${env.REVIEW_TASK_ID}?blockOn=${params.BLOCK_ON}"
-                    def result = readJSON text: httpRequest(httpMode: 'GET', url: url, validResponseCodes: '200').content
+                    def gateResp = httpRequest(httpMode: 'GET', url: url, validResponseCodes: '200')
+                    def result = readJSON text: gateResp.content
                     def s = result.summary
                     echo "审查结果: ${result.passed ? '✅ 通过' : '❌ 未通过'} | C:${s?.critical} H:${s?.high} M:${s?.medium} L:${s?.low}"
                     currentBuild.description = "C:${s?.critical} H:${s?.high} M:${s?.medium} L:${s?.low}"
