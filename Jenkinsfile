@@ -58,7 +58,7 @@ pipeline {
                     // 在 single-quote shell 中直接用 $变量名 引用
                     def response = sh(
                         script: '''
-                            BODY=$(printf '{"gitUrl":"%s","branch":"%s","commitHash":"%s","triggerBy":"JENKINS","blockOn":"%s"}' \
+                            BODY=$(printf '{"gitUrl":"%s","branch":"%s","commitHash":"%s","triggerBy":"JENKINS","blockOn":"%s","modelProvider":"QWEN","agentLoop":false}' \
                                 "$GIT_URL_FULL" "$GIT_BRANCH" "$GIT_COMMIT_SHA" "$BLOCK_ON")
                             curl -s -X POST "$CODE_GUARDIAN_URL/api/v1/cicd/trigger" \
                                 -H "Content-Type: application/json" \
