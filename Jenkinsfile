@@ -8,7 +8,8 @@ pipeline {
     environment {
         POLL_INTERVAL_SEC = '15'
         POLL_TIMEOUT_MIN  = '30'
-        // 从 Jenkins Credentials 中读取账号密码（不会打印到日志）
+        // credentials() 会自动将账号密码注入为 shell 环境变量
+        // CG_CREDS_USR = 账号, CG_CREDS_PSW = 密码（日志中自动屏蔽）
         CG_CREDS = credentials('codeguardian-credentials')
     }
     stages {
@@ -28,26 +29,24 @@ pipeline {
         stage('Login to CodeGuardian') {
             steps {
                 script {
-                    // POST /api/auth/login，获取 satoken
-                    def loginResp = sh(
-                        script: """curl -s -X POST "${params.CODE_GUARDIAN_URL}/api/auth/login" \
-                            -H "Content-Type: application/json" \
-                            -d '{"usernameOrEmail":"${env.CG_CREDS_USR}","password":"${env.CG_CREDS_PSW}'\\''""",
-                        returnStdout: true
-                    ).trim()
-
-                    echo "登录响应: ${loginResp}"
-
-                    // 提取 token 字段
+                    // 全程使用 single-quote shell('''...''')，让 shell 解析 $变量
+                    // 避免 Groovy 插值 credentials，消除安全警告和语法错误
                     env.CG_TOKEN = sh(
-                        script: """echo '${loginResp}' | grep -o '"token":"[^"]*"' | grep -o ':[^}]*' | tr -d ':"'""",
+                        script: '''
+                            BODY=$(printf '{"usernameOrEmail":"%s","password":"%s"}' "$CG_CREDS_USR" "$CG_CREDS_PSW")
+                            LOGIN_RESP=$(curl -s -X POST "$CODE_GUARDIAN_URL/api/auth/login" \
+                                -H "Content-Type: application/json" \
+                                -d "$BODY")
+                            echo "登录响应: $LOGIN_RESP" >&2
+                            echo "$LOGIN_RESP" | grep -o '"token":"[^"]*"' | grep -o ':"[^"]*"' | tr -d ':"'
+                        ''',
                         returnStdout: true
                     ).trim()
 
                     if (!env.CG_TOKEN) {
-                        error("登录失败，未获取到 Token，请检查 codeguardian-credentials 中的账号密码是否正确")
+                        error("登录失败，未获取到 Token，请检查 codeguardian-credentials 中账号密码是否正确")
                     }
-                    echo "登录成功，已获取 Token"
+                    echo "登录成功"
                 }
             }
         }
@@ -55,18 +54,23 @@ pipeline {
         stage('Trigger Code Review') {
             steps {
                 script {
-                    def body = """{"gitUrl":"${env.GIT_URL_FULL}","branch":"${env.GIT_BRANCH}","commitHash":"${env.GIT_COMMIT_SHA}","triggerBy":"JENKINS","blockOn":"${params.BLOCK_ON}"}"""
+                    // GIT_URL_FULL / GIT_BRANCH / GIT_COMMIT_SHA / CG_TOKEN 均为 env 变量
+                    // 在 single-quote shell 中直接用 $变量名 引用
                     def response = sh(
-                        script: """curl -s -X POST "${params.CODE_GUARDIAN_URL}/api/v1/cicd/trigger" \
-                            -H "Content-Type: application/json" \
-                            -H "satoken: ${env.CG_TOKEN}" \
-                            -d '${body}'""",
+                        script: '''
+                            BODY=$(printf '{"gitUrl":"%s","branch":"%s","commitHash":"%s","triggerBy":"JENKINS","blockOn":"%s"}' \
+                                "$GIT_URL_FULL" "$GIT_BRANCH" "$GIT_COMMIT_SHA" "$BLOCK_ON")
+                            curl -s -X POST "$CODE_GUARDIAN_URL/api/v1/cicd/trigger" \
+                                -H "Content-Type: application/json" \
+                                -H "satoken: $CG_TOKEN" \
+                                -d "$BODY"
+                        ''',
                         returnStdout: true
                     ).trim()
                     echo "触发响应: ${response}"
 
                     env.REVIEW_TASK_ID = sh(
-                        script: """echo '${response}' | grep -o '"taskId":[0-9]*' | grep -o '[0-9]*'""",
+                        script: "echo '${response}' | grep -o '\"taskId\":[0-9]*' | grep -o '[0-9]*'",
                         returnStdout: true
                     ).trim()
                     echo "审查任务已提交，Task ID: ${env.REVIEW_TASK_ID}"
@@ -81,21 +85,25 @@ pipeline {
         stage('Wait for Review') {
             steps {
                 script {
-                    def statusUrl = "${params.CODE_GUARDIAN_URL}/api/v1/cicd/status/${env.REVIEW_TASK_ID}?blockOn=${params.BLOCK_ON}"
                     timeout(time: env.POLL_TIMEOUT_MIN.toInteger(), unit: 'MINUTES') {
                         waitUntil(initialRecurrencePeriod: env.POLL_INTERVAL_SEC.toInteger() * 1000) {
                             def resp = sh(
-                                script: """curl -s "${statusUrl}" -H "satoken: ${env.CG_TOKEN}" """,
+                                script: '''
+                                    curl -s "$CODE_GUARDIAN_URL/api/v1/cicd/status/$REVIEW_TASK_ID?blockOn=$BLOCK_ON" \
+                                        -H "satoken: $CG_TOKEN"
+                                ''',
                                 returnStdout: true
                             ).trim()
+
                             def status = sh(
-                                script: """echo '${resp}' | grep -o '"status":"[^"]*"' | head -1 | grep -o ':"[^"]*"' | tr -d ':"'""",
+                                script: "echo '${resp}' | grep -o '\"status\":\"[^\"]*\"' | head -1 | grep -o ':\"[^\"]*\"' | tr -d ':\"'",
                                 returnStdout: true
                             ).trim()
                             def message = sh(
-                                script: """echo '${resp}' | grep -o '"message":"[^"]*"' | grep -o ':"[^"]*"' | tr -d ':"'""",
+                                script: "echo '${resp}' | grep -o '\"message\":\"[^\"]*\"' | grep -o ':\"[^\"]*\"' | tr -d ':\"'",
                                 returnStdout: true
                             ).trim()
+
                             echo "当前状态: ${status} | ${message}"
                             return (status == 'COMPLETED' || status == 'FAILED')
                         }
@@ -107,18 +115,20 @@ pipeline {
         stage('Quality Gate') {
             steps {
                 script {
-                    def statusUrl = "${params.CODE_GUARDIAN_URL}/api/v1/cicd/status/${env.REVIEW_TASK_ID}?blockOn=${params.BLOCK_ON}"
                     def resp = sh(
-                        script: """curl -s "${statusUrl}" -H "satoken: ${env.CG_TOKEN}" """,
+                        script: '''
+                            curl -s "$CODE_GUARDIAN_URL/api/v1/cicd/status/$REVIEW_TASK_ID?blockOn=$BLOCK_ON" \
+                                -H "satoken: $CG_TOKEN"
+                        ''',
                         returnStdout: true
                     ).trim()
                     echo "最终审查结果: ${resp}"
 
-                    def passed   = sh(script: """echo '${resp}' | grep -o '"passed":[a-z]*' | grep -o '[a-z]*\$'""", returnStdout: true).trim()
-                    def critical = sh(script: """echo '${resp}' | grep -o '"critical":[0-9]*' | grep -o '[0-9]*'""", returnStdout: true).trim() ?: '0'
-                    def high     = sh(script: """echo '${resp}' | grep -o '"high":[0-9]*' | grep -o '[0-9]*'""",     returnStdout: true).trim() ?: '0'
-                    def medium   = sh(script: """echo '${resp}' | grep -o '"medium":[0-9]*' | grep -o '[0-9]*'""",   returnStdout: true).trim() ?: '0'
-                    def low      = sh(script: """echo '${resp}' | grep -o '"low":[0-9]*' | grep -o '[0-9]*'""",      returnStdout: true).trim() ?: '0'
+                    def passed   = sh(script: "echo '${resp}' | grep -o '\"passed\":[a-z]*' | grep -o '[a-z]*\$'", returnStdout: true).trim()
+                    def critical = sh(script: "echo '${resp}' | grep -o '\"critical\":[0-9]*' | grep -o '[0-9]*'", returnStdout: true).trim() ?: '0'
+                    def high     = sh(script: "echo '${resp}' | grep -o '\"high\":[0-9]*' | grep -o '[0-9]*'",     returnStdout: true).trim() ?: '0'
+                    def medium   = sh(script: "echo '${resp}' | grep -o '\"medium\":[0-9]*' | grep -o '[0-9]*'",   returnStdout: true).trim() ?: '0'
+                    def low      = sh(script: "echo '${resp}' | grep -o '\"low\":[0-9]*' | grep -o '[0-9]*'",      returnStdout: true).trim() ?: '0'
 
                     echo "审查结果: ${passed == 'true' ? '✅ 通过' : '❌ 未通过'} | C:${critical} H:${high} M:${medium} L:${low}"
                     currentBuild.description = "${passed == 'true' ? '✅' : '❌'} C:${critical} H:${high} M:${medium} L:${low}"
